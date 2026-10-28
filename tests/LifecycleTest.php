@@ -7,10 +7,10 @@ namespace Lemonade\Profiler\Tests;
 use Lemonade\Framework\Observability\Http\HttpMetrics;
 use Lemonade\Framework\Observability\Http\Internal\HttpInstrumentation;
 use Lemonade\Framework\View\ViewRendererInterface;
-use Lemonade\Profiler\ProfileContext;
-use Lemonade\Profiler\ProfiledViewRenderer;
+use Lemonade\Profiler\Capture\ProfileContext;
+use Lemonade\Profiler\Capture\SqlSanitizer;
+use Lemonade\Profiler\Presentation\ProfiledViewRenderer;
 use Lemonade\Profiler\ProfilerConfig;
-use Lemonade\Profiler\SqlSanitizer;
 use Lemonade\Profiler\Tests\Support\TestApplication;
 use Nyholm\Psr7\Response;
 use Nyholm\Psr7\ServerRequest;
@@ -35,7 +35,7 @@ final class LifecycleTest extends TestCase
 
     public function testRendererPreservesResultsDataAndExceptions(): void
     {
-        $context = new ProfileContext(new ProfilerConfig(), new SqlSanitizer(), hrtime(true));
+        $context = new ProfileContext(config: new ProfilerConfig(), sanitizer: new SqlSanitizer(), startedNs: hrtime(true));
         $inner = $this->createMock(ViewRendererInterface::class);
         $response = new Response(202, [], 'unchanged');
         $inner->expects(self::once())->method('render')->with('page', ['secret' => 'private'], 202)->willReturn($response);
@@ -49,11 +49,11 @@ final class LifecycleTest extends TestCase
         } catch (RuntimeException $actual) {
             self::assertSame($exception, $actual);
         }
-        $context->completed(new HttpMetrics(10.0, 1024, 0, 0.0));
+        $context->completed(new HttpMetrics(durationMs: 10.0, phpPeakMemoryBytes: 1024, sqlCount: 0, sqlMs: 0.0));
         $profile = $context->snapshot('GET', 202, null);
-        self::assertSame([true, false], array_column($profile->data['renderings'], 'completed'));
-        self::assertSame([1, 2], array_column($profile->data['renderings'], 'order'));
-        self::assertStringNotContainsString('private', json_encode($profile->data, JSON_THROW_ON_ERROR));
-        self::assertStringNotContainsString('secret', json_encode($profile->data, JSON_THROW_ON_ERROR));
+        self::assertSame([true, false], array_column($profile->toArray()['renderings'], 'completed'));
+        self::assertSame([1, 2], array_column($profile->toArray()['renderings'], 'order'));
+        self::assertStringNotContainsString('private', json_encode($profile->toArray(), JSON_THROW_ON_ERROR));
+        self::assertStringNotContainsString('secret', json_encode($profile->toArray(), JSON_THROW_ON_ERROR));
     }
 }

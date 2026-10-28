@@ -2,14 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Lemonade\Profiler;
+namespace Lemonade\Profiler\Capture;
 
 use Closure;
 use Lemonade\Framework\Database\Instrumentation\DatabaseObserverInterface;
+
 use Lemonade\Framework\Observability\Http\HttpCheckpoint;
 use Lemonade\Framework\Observability\Http\HttpDiagnosticsObserverInterface;
 use Lemonade\Framework\Observability\Http\HttpMetrics;
 use Lemonade\Framework\Routing\RouteMatch;
+use Lemonade\Profiler\Http\ProfilerResponseDecorator;
+use Lemonade\Profiler\Storage\ProfileStore;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 
@@ -22,11 +25,14 @@ final readonly class ProfilerCapture implements HttpDiagnosticsObserverInterface
      * Defers storage resolution until after bootstrap and completion of the measured interval.
      *
      * @param Closure(): ProfileStore $store
+     * @param Closure(): ProfilerResponseDecorator $decorator
      */
     public function __construct(
         private ProfileContext $context,
         private Closure $store,
-        private ProfilerResponseDecorator $decorator,
+        private Closure $decorator,
+        private string $environment = 'dev',
+        private ?string $applicationRoot = null,
     ) {}
 
     /**
@@ -58,7 +64,7 @@ final readonly class ProfilerCapture implements HttpDiagnosticsObserverInterface
      */
     public function queryCompleted(string $sql, float $durationMs, bool $successful): void
     {
-        $this->context->queryCompleted($sql, $durationMs, $successful);
+        $this->context->queryCompleted(sql: $sql, elapsedMs: $durationMs, successful: $successful);
     }
 
     /**
@@ -66,7 +72,7 @@ final readonly class ProfilerCapture implements HttpDiagnosticsObserverInterface
      */
     public function connectionCompleted(float $durationMs, bool $successful): void
     {
-        $this->context->connectionCompleted($durationMs, $successful);
+        $this->context->connectionCompleted(elapsedMs: $durationMs, successful: $successful);
     }
 
     /**
@@ -74,9 +80,19 @@ final readonly class ProfilerCapture implements HttpDiagnosticsObserverInterface
      */
     public function response(ServerRequestInterface $request, ResponseInterface $response, ?RouteMatch $match): ResponseInterface
     {
-        $profile = $this->context->snapshot($request->getMethod(), $response->getStatusCode(), $match);
+        $this->context->captureRuntime($this->environment, $request->getServerParams()['SERVER_SOFTWARE'] ?? null, $this->applicationRoot);
+        $profile = $this->context->snapshot(
+            method: $request->getMethod(),
+            status: $response->getStatusCode(),
+            match: $match,
+        );
         ($this->store)()->save($profile);
 
-        return $this->decorator->decorate($request, $response, $profile->data['id']);
+        return ($this->decorator)()->decorate(
+            request: $request,
+            response: $response,
+            id: $profile->id(),
+            profile: $profile,
+        );
     }
 }

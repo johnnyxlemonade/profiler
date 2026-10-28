@@ -56,9 +56,13 @@ PHP);
         file_put_contents($this->root . '/app/Views/page.php', '<!doctype html><html><head><title>Test page</title></head><body><?php echo $this->partial("partial"); ?></body></html>');
         file_put_contents($this->root . '/app/Views/partial.php', '<p>Public content</p>');
         $this->container = new Container();
-        $context = new ApplicationContext($environment, new Path($this->root), new DebugMode($debug));
+        $context = new ApplicationContext(
+            environment: $environment,
+            paths: new Path($this->root),
+            debug: new DebugMode($debug),
+        );
         $this->kernel = (new KernelFactory(
-            $this->container,
+            container: $this->container,
             diagnostics: $earlyObserver ? new ProfilerServiceProvider($context) : null,
         ))->create($context);
         if ($config !== null) {

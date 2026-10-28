@@ -6,19 +6,29 @@ namespace Lemonade\Profiler\Tests;
 
 use Lemonade\Framework\Core\Context\Environment;
 use Lemonade\Framework\Observability\Http\Internal\HttpInstrumentation;
+use Lemonade\Profiler\Http\ProfilerMiddleware;
+use Lemonade\Profiler\Http\ProfilerRequestHandler;
+use Lemonade\Profiler\Presentation\ProfilerUi;
+use Lemonade\Profiler\Profile;
 use Lemonade\Profiler\ProfilerConfig;
-use Lemonade\Profiler\ProfilerMiddleware;
-use Lemonade\Profiler\ProfileStore;
+use Lemonade\Profiler\Storage\ProfileStore;
 use Lemonade\Profiler\Tests\Support\TestApplication;
+use Nyholm\Psr7\Factory\Psr17Factory;
 use Nyholm\Psr7\ServerRequest;
 use PHPUnit\Framework\TestCase;
+use Psr\Http\Message\ResponseFactoryInterface;
+use Psr\Http\Message\StreamFactoryInterface;
+use Psr\Http\Message\StreamInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+use RuntimeException;
 
 final class KernelIntegrationTest extends TestCase
 {
     private TestApplication $app;
 
-    protected function setUp(): void
+    public function __construct(string $name)
     {
+        parent::__construct($name);
         $this->app = new TestApplication();
     }
 
@@ -41,21 +51,50 @@ final class KernelIntegrationTest extends TestCase
         $profiles = $this->app->container->get(ProfileStore::class)->history();
         self::assertCount(2, $profiles);
         foreach ($profiles as $profile) {
-            self::assertSame(2, $profile->data['sql_count']);
-            self::assertCount(2, $profile->data['queries']);
-            self::assertCount(1, $profile->data['renderings']);
-            self::assertSame('page', $profile->data['renderings'][0]['template']);
-            self::assertTrue($profile->data['renderings'][0]['completed']);
-            self::assertSame('fixture.page', $profile->data['route']);
-            self::assertSame('/page/{id}', $profile->data['path']);
-            self::assertGreaterThan(0, $profile->data['duration_ms']);
-            self::assertGreaterThan(0, $profile->data['peak_bytes']);
-            $json = file_get_contents($this->app->root . '/storage/writable/profiler/' . $profile->data['id'] . '.json');
+            $diagnostics = $profile->toArray()['diagnostics'] ?? [];
+            self::assertNotEmpty($diagnostics);
+            self::assertArrayHasKey('session', $diagnostics);
+            self::assertSame(PHP_VERSION, $diagnostics['server']['values']['php_version']);
+            self::assertNotEmpty($diagnostics['composer']['entries']);
+            self::assertSame(2, $profile->toArray()['sql_count']);
+            self::assertCount(2, $profile->toArray()['queries']);
+            self::assertCount(1, $profile->toArray()['renderings']);
+            self::assertSame('page', $profile->toArray()['renderings'][0]['template']);
+            self::assertTrue($profile->toArray()['renderings'][0]['completed']);
+            self::assertSame('fixture.page', $profile->toArray()['route']);
+            self::assertSame('/page/{id}', $profile->toArray()['path']);
+            self::assertGreaterThan(0, $profile->toArray()['duration_ms']);
+            self::assertGreaterThan(0, $profile->toArray()['peak_bytes']);
+            $json = file_get_contents($this->app->root . '/storage/writable/profiler/' . $profile->id() . '.json');
             self::assertIsString($json);
             self::assertStringNotContainsString('secret-', $json);
             self::assertStringNotContainsString('bindings', $json);
         }
         self::assertNull($this->app->container->get(HttpInstrumentation::class)->observer());
+    }
+
+    public function testToolbarMetadataUsesStoredTotalsAndContainsNoRequestSecrets(): void
+    {
+        $response = $this->app->kernel->run(new ServerRequest('GET', '/page/secret-id?token=secret-token'));
+        $profile = $this->app->container->get(ProfileStore::class)->history()[0];
+        $json = rawurldecode($response->getHeaderLine('X-Lemonade-Profiler-Metrics'));
+        $metadata = json_decode($json, true, 32, JSON_THROW_ON_ERROR);
+        self::assertIsArray($metadata);
+        self::assertSame(['id', 'method', 'status', 'route', 'path', 'duration_ms', 'peak_bytes', 'sql_count', 'sql_ms'], array_keys($metadata));
+        foreach ($metadata as $key => $value) {
+            self::assertEquals($profile->toArray()[$key], $value);
+        }
+        self::assertStringNotContainsString('secret-', $json);
+        self::assertFalse($response->hasHeader('X-Lemonade-Time-Ms'));
+        $toolbar = $this->app->container->get(ProfilerUi::class)->toolbarData($profile);
+        self::assertSame($profile->toArray()['diagnostics']['server']['values']['php_version'] ?? null, $toolbar['server']['php_version']);
+        self::assertSame($profile->toArray()['diagnostics']['server']['values']['web_server'] ?? null, $toolbar['server']['web_server']);
+        self::assertCount(9, $toolbar['server']);
+        self::assertArrayNotHasKey('diagnostics', $toolbar);
+        $durations = array_column($profile->toArray()['queries'], 'elapsed_ms');
+        self::assertNotEmpty($durations);
+        self::assertSame(max(0.0, ...$durations), $toolbar['longest']['elapsed_ms']);
+        self::assertStringNotContainsString('secret-', json_encode($toolbar, JSON_THROW_ON_ERROR));
     }
 
     public function testHeadersAndProfilerShareTotalsIncludingBootstrapAndMiddlewareUnwind(): void
@@ -78,7 +117,7 @@ PROVIDERS);
         self::assertSame(200, $response->getStatusCode());
         $profiles = $this->app->container->get(ProfileStore::class)->history();
         self::assertCount(1, $profiles);
-        $data = $profiles[0]->data;
+        $data = $profiles[0]->toArray();
         self::assertSame(4, $data['sql_count']);
         self::assertCount(4, $data['queries']);
         self::assertSame(array_sum(array_column($data['queries'], 'elapsed_ms')), $data['sql_ms']);
@@ -103,24 +142,99 @@ PROVIDERS);
         self::assertSame(404, $missing->getStatusCode());
         $profiles = $this->app->container->get(ProfileStore::class)->history();
         self::assertCount(2, $profiles);
-        self::assertSame([404, 200], array_column(array_column($profiles, 'data'), 'status'));
-        self::assertSame([0, 0], array_column(array_column($profiles, 'data'), 'sql_count'));
-        self::assertNotContains('bootstrap_started', array_column($profiles[1]->data['marks'], 'name'));
+        $snapshots = array_map(static fn(Profile $profile): array => $profile->toArray(), $profiles);
+        self::assertSame([404, 200], array_column($snapshots, 'status'));
+        self::assertSame([0, 0], array_column($snapshots, 'sql_count'));
+        self::assertNotContains('bootstrap_started', array_column($profiles[1]->toArray()['marks'], 'name'));
     }
 
     public function testProfilerResourcesDoNotCreateProfiles(): void
     {
         $response = $this->app->kernel->run(new ServerRequest('GET', '/page/1'));
         $detail = $response->getHeaderLine('X-Lemonade-Profiler');
-        foreach (['/_lemonade/profiler', $detail, '/_lemonade/profiler/assets/profiler.css'] as $path) {
+        $resources = [
+            '/_lemonade/profiler' => 'text/html; charset=utf-8',
+            $detail => 'text/html; charset=utf-8',
+            '/_lemonade/profiler/assets/profiler.css' => 'text/css; charset=utf-8',
+            '/_lemonade/profiler/assets/toolbar.css' => 'text/css; charset=utf-8',
+            '/_lemonade/profiler/assets/symbol.svg' => 'image/svg+xml',
+        ];
+        foreach (['toolbar.js', 'profiler-toolbar.js', 'request-monitor.js', 'icons.js', 'format.js', 'history-filters.js'] as $name) {
+            $resources['/_lemonade/profiler/assets/' . $name] = 'text/javascript; charset=utf-8';
+        }
+        foreach ($resources as $path => $type) {
             $resource = $this->app->kernel->run(new ServerRequest('GET', $path));
             self::assertSame(200, $resource->getStatusCode());
+            self::assertSame($type, $resource->getHeaderLine('Content-Type'));
             self::assertSame('no-store', $resource->getHeaderLine('Cache-Control'));
+            self::assertSame('no-referrer', $resource->getHeaderLine('Referrer-Policy'));
+            self::assertSame('nosniff', $resource->getHeaderLine('X-Content-Type-Options'));
+            self::assertNotSame('', $resource->getHeaderLine('Content-Security-Policy'));
+            self::assertStringContainsString("img-src 'self'", $resource->getHeaderLine('Content-Security-Policy'));
+            if ($path === '/_lemonade/profiler') {
+                self::assertStringContainsString("script-src 'self'", $resource->getHeaderLine('Content-Security-Policy'));
+            }
+            if ($path === $detail) {
+                self::assertStringNotContainsString('script-src', $resource->getHeaderLine('Content-Security-Policy'));
+            }
             self::assertFalse($resource->hasHeader('X-Lemonade-Profiler'));
+            if (str_contains($path, '/assets/')) {
+                $name = basename($path);
+                $directory = str_ends_with($name, '.css') ? 'css' : (str_ends_with($name, '.svg') ? 'brand' : 'js');
+                self::assertSame(
+                    file_get_contents(dirname(__DIR__) . '/resources/assets/' . $directory . '/' . $name),
+                    (string) $resource->getBody(),
+                );
+            }
         }
+        $head = $this->app->kernel->run(new ServerRequest('HEAD', '/_lemonade/profiler/assets/toolbar.js'));
+        self::assertSame(200, $head->getStatusCode());
+        self::assertSame('', (string) $head->getBody());
+        self::assertSame('text/javascript; charset=utf-8', $head->getHeaderLine('Content-Type'));
         self::assertCount(1, $this->app->container->get(ProfileStore::class)->history());
-        self::assertSame(405, $this->app->kernel->run(new ServerRequest('POST', '/_lemonade/profiler'))->getStatusCode());
+        $methodNotAllowed = $this->app->kernel->run(new ServerRequest('POST', '/_lemonade/profiler'));
+        self::assertSame(405, $methodNotAllowed->getStatusCode());
+        self::assertSame('GET, HEAD', $methodNotAllowed->getHeaderLine('Allow'));
         self::assertSame(404, $this->app->kernel->run(new ServerRequest('GET', '/_lemonade/profiler/request/invalid'))->getStatusCode());
+        foreach (['unknown.js', '../i18n/en.json', '%2e%2e/i18n/en.json', 'js/toolbar.js', 'toolbar.js/extra', 'toolbar.js%00'] as $name) {
+            $resource = $this->app->kernel->run(new ServerRequest('GET', '/_lemonade/profiler/assets/' . $name));
+            self::assertSame(404, $resource->getStatusCode());
+        }
+    }
+
+    public function testPresentationFailureIsNotReportedAsStorageFailure(): void
+    {
+        $this->app->kernel->bootstrap();
+        $failure = new RuntimeException('Presentation failed');
+        $calls = 0;
+        $streams = $this->createMock(StreamFactoryInterface::class);
+        $streams->method('createStream')->willReturnCallback(static function (string $content) use (&$calls, $failure): StreamInterface {
+            if (++$calls === 1) {
+                throw $failure;
+            }
+
+            return (new Psr17Factory())->createStream($content);
+        });
+        $handler = new ProfilerRequestHandler(
+            config: $this->app->container->get(ProfilerConfig::class),
+            store: $this->app->container->get(ProfileStore::class),
+            ui: $this->app->container->get(ProfilerUi::class),
+            assets: $this->app->container->get(\Lemonade\Profiler\Presentation\ProfilerAssets::class),
+            responses: $this->app->container->get(ResponseFactoryInterface::class),
+            streams: $streams,
+        );
+        $middleware = new ProfilerMiddleware(
+            config: $this->app->container->get(ProfilerConfig::class),
+            profiler: static fn(): ProfilerRequestHandler => $handler,
+        );
+
+        $response = $middleware->process(
+            new ServerRequest('GET', '/_lemonade/profiler'),
+            $this->createMock(RequestHandlerInterface::class),
+        );
+        self::assertSame(503, $response->getStatusCode());
+        self::assertSame('Profiler is unavailable', (string) $response->getBody());
+        self::assertSame(1, $calls);
     }
 
     public function testHandledExceptionKeepsItsStatusAndDoesNotLeakIntoNextRequest(): void
@@ -129,22 +243,33 @@ PROVIDERS);
         self::assertSame(500, $error->getStatusCode());
         $this->app->kernel->run(new ServerRequest('GET', '/page/clean'));
         $profiles = $this->app->container->get(ProfileStore::class)->history();
-        self::assertSame([2, 1], array_column(array_column($profiles, 'data'), 'sql_count'));
-        self::assertStringNotContainsString('secret-exception', json_encode($profiles, JSON_THROW_ON_ERROR));
+        $snapshots = array_map(static fn(Profile $profile): array => $profile->toArray(), $profiles);
+        self::assertSame([2, 1], array_column($snapshots, 'sql_count'));
+        self::assertStringNotContainsString('secret-exception', json_encode($snapshots, JSON_THROW_ON_ERROR));
     }
 
-    public function testProductionNeverRegistersProfilerEvenWhenProviderIsConfigured(): void
+    public function testEnabledProfilerWorksInDevelopmentAndProductionWithEitherDebugMode(): void
     {
-        $production = new TestApplication(Environment::Production, debug: true);
-        try {
-            $response = $production->kernel->run(new ServerRequest('GET', '/page/1'));
-            self::assertSame(200, $response->getStatusCode());
-            self::assertFalse($response->hasHeader('X-Lemonade-Profiler'));
-            self::assertFalse($production->container->isBound(ProfilerMiddleware::class));
-            self::assertDirectoryDoesNotExist($production->root . '/storage/writable/profiler');
-            self::assertSame(404, $production->kernel->run(new ServerRequest('GET', '/_lemonade/profiler'))->getStatusCode());
-        } finally {
-            $production->close();
+        foreach ([Environment::Development, Environment::Production] as $environment) {
+            foreach ([false, true] as $debug) {
+                foreach ([false, true] as $earlyObserver) {
+                    $application = new TestApplication($environment, debug: $debug, earlyObserver: $earlyObserver);
+                    try {
+                        $response = $application->kernel->run(new ServerRequest('GET', '/page/1'));
+                        self::assertSame(200, $response->getStatusCode());
+                        self::assertTrue($application->container->isBound(ProfilerMiddleware::class));
+                        self::assertTrue($response->hasHeader('X-Lemonade-Profiler'));
+                        self::assertTrue($response->hasHeader('X-Lemonade-Profiler-Metrics'));
+                        self::assertStringContainsString('data-lemonade-profile=', (string) $response->getBody());
+                        self::assertCount(1, $application->container->get(ProfileStore::class)->history());
+                        self::assertSame(200, $application->kernel->run(new ServerRequest('GET', '/_lemonade/profiler'))->getStatusCode());
+                        self::assertSame(200, $application->kernel->run(new ServerRequest('GET', $response->getHeaderLine('X-Lemonade-Profiler')))->getStatusCode());
+                        self::assertNull($application->container->get(HttpInstrumentation::class)->observer());
+                    } finally {
+                        $application->close();
+                    }
+                }
+            }
         }
     }
 
@@ -188,6 +313,34 @@ YAML);
         self::assertNull($this->app->container->get(HttpInstrumentation::class)->observer());
     }
 
+    public function testExplicitEarlyFactoryStoresBootstrapFailureBeforeFilesystemRegistration(): void
+    {
+        $application = new TestApplication(earlyObserver: true);
+        try {
+            file_put_contents($application->root . '/app/Config/Providers.yaml', <<<'YAML'
+module: providers
+config:
+  providers:
+    - Missing\OptionalPackage\ServiceProvider
+YAML);
+
+            $response = $application->kernel->run(new ServerRequest('GET', '/page/1'));
+            self::assertSame(500, $response->getStatusCode());
+            self::assertTrue($response->hasHeader('X-Lemonade-Profiler'));
+            self::assertTrue($response->hasHeader('X-Lemonade-Profiler-Metrics'));
+            self::assertFalse($application->container->isBound(ProfileStore::class));
+            $profiles = glob($application->root . '/storage/writable/profiler/*.json');
+            self::assertIsArray($profiles);
+            self::assertCount(1, $profiles);
+            $json = file_get_contents($profiles[0]);
+            self::assertIsString($json);
+            self::assertSame(500, json_decode($json, true, 32, JSON_THROW_ON_ERROR)['status']);
+            self::assertNull($application->container->get(HttpInstrumentation::class)->observer());
+        } finally {
+            $application->close();
+        }
+    }
+
     public function testExplicitEarlyFactoryStillCapturesConfigurationExactlyOnce(): void
     {
         $application = new TestApplication(earlyObserver: true);
@@ -195,21 +348,35 @@ YAML);
             self::assertSame(200, $application->kernel->run(new ServerRequest('GET', '/page/1'))->getStatusCode());
             $profiles = $application->container->get(ProfileStore::class)->history();
             self::assertCount(1, $profiles);
-            self::assertSame(2, $profiles[0]->data['sql_count']);
-            self::assertContains('configuration_loaded', array_column($profiles[0]->data['marks'], 'name'));
+            self::assertSame(2, $profiles[0]->toArray()['sql_count']);
+            self::assertContains('configuration_loaded', array_column($profiles[0]->toArray()['marks'], 'name'));
         } finally {
             $application->close();
         }
     }
 
-    public function testDisabledProfilerDoesNotRegisterCapture(): void
+    public function testDisabledProfilerHasNoCaptureHeadersToolbarOrEndpointsInAnyEnvironment(): void
     {
-        $disabled = new TestApplication(config: new ProfilerConfig(enabled: false));
-        try {
-            self::assertSame(200, $disabled->kernel->run(new ServerRequest('GET', '/page/1'))->getStatusCode());
-            self::assertFalse($disabled->container->isBound(ProfilerMiddleware::class));
-        } finally {
-            $disabled->close();
+        foreach ([Environment::Development, Environment::Production] as $environment) {
+            foreach ([false, true] as $debug) {
+                foreach ([false, true] as $earlyObserver) {
+                    $application = new TestApplication($environment, new ProfilerConfig(enabled: false), $debug, $earlyObserver);
+                    try {
+                        $response = $application->kernel->run(new ServerRequest('GET', '/page/1'));
+                        self::assertSame(200, $response->getStatusCode());
+                        self::assertFalse($application->container->isBound(ProfilerMiddleware::class));
+                        self::assertFalse($response->hasHeader('X-Lemonade-Profiler'));
+                        self::assertFalse($response->hasHeader('X-Lemonade-Profiler-Metrics'));
+                        self::assertStringNotContainsString('data-lemonade-profile=', (string) $response->getBody());
+                        self::assertFalse($application->container->isBound(ProfileStore::class));
+                        self::assertDirectoryDoesNotExist($application->root . '/storage/writable/profiler');
+                        self::assertSame(404, $application->kernel->run(new ServerRequest('GET', '/_lemonade/profiler'))->getStatusCode());
+                        self::assertNull($application->container->get(HttpInstrumentation::class)->observer());
+                    } finally {
+                        $application->close();
+                    }
+                }
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Lemonade\Profiler;
+namespace Lemonade\Profiler\Capture;
 
 /**
  * Lexes a conservative SQL subset; ambiguous syntax never returns raw text.

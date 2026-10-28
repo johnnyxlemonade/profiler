@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Lemonade\Profiler\Tests;
 
-use Lemonade\Profiler\SqlSanitizer;
+use Lemonade\Profiler\Capture\SqlSanitizer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 

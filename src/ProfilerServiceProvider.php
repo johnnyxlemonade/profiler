@@ -19,12 +19,24 @@ use Lemonade\Framework\Http\Middleware\MiddlewareStack;
 use Lemonade\Framework\Observability\Http\HttpDiagnosticsObserverFactoryInterface;
 use Lemonade\Framework\Observability\Http\HttpDiagnosticsObserverInterface;
 use Lemonade\Framework\Observability\Http\Internal\HttpInstrumentation;
+use Lemonade\Framework\Session\Config\SessionConfig;
+use Lemonade\Framework\Session\Contract\SessionInterface;
 use Lemonade\Framework\View\ViewRendererInterface;
+use Lemonade\Profiler\Capture\ProfileContext;
+use Lemonade\Profiler\Capture\ProfilerCapture;
+use Lemonade\Profiler\Capture\SqlSanitizer;
+use Lemonade\Profiler\Http\ProfilerMiddleware;
+use Lemonade\Profiler\Http\ProfilerRequestHandler;
+use Lemonade\Profiler\Http\ProfilerResponseDecorator;
+use Lemonade\Profiler\Presentation\ProfiledViewRenderer;
+use Lemonade\Profiler\Presentation\ProfilerUi;
+use Lemonade\Profiler\Storage\ProfileStore;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Message\StreamFactoryInterface;
 
 /**
- * Registers optional HTTP diagnostics only for a development application context.
+ * Registers optional HTTP diagnostics when enabled in the application configuration.
  */
 final readonly class ProfilerServiceProvider implements ServiceProviderInterface, BootableServiceProviderInterface, HttpDiagnosticsObserverFactoryInterface
 {
@@ -36,27 +48,38 @@ final readonly class ProfilerServiceProvider implements ServiceProviderInterface
     ) {}
 
     /**
-     * Creates capture before bootstrap only in development and outside the profiler's own URLs.
+     * Creates capture before bootstrap when enabled and outside the profiler's own URLs.
      */
     public function create(ContainerInterface $container, ServerRequestInterface $request, int|float $startedNs): ?HttpDiagnosticsObserverInterface
     {
-        if (!$this->context->isDevelopment()) {
-            return null;
-        }
-        $config = $container instanceof ContainerBuilderInterface && $container->isBound(ProfilerConfig::class)
-            ? $container->get(ProfilerConfig::class)
-            : new ProfilerConfig();
+        $config = $container->get(ProfilerConfig::class);
         $path = $request->getUri()->getPath();
-        if (!$config->enabled || $path === ProfilerConfig::PREFIX || str_starts_with($path, ProfilerConfig::PREFIX . '/')) {
+        if (!$config->enabled() || $path === ProfilerConfig::PREFIX || str_starts_with($path, ProfilerConfig::PREFIX . '/')) {
             return null;
         }
 
         return new ProfilerCapture(
-            new ProfileContext($config, new SqlSanitizer(), $startedNs),
-            fn(): ProfileStore => $container instanceof ContainerBuilderInterface && $container->isBound(ProfileStore::class)
+            context: new ProfileContext(
+                config: $config,
+                sanitizer: $container->get(SqlSanitizer::class),
+                startedNs: $startedNs,
+            ),
+            store: fn(): ProfileStore => $container->has(ProfileStore::class)
                 ? $container->get(ProfileStore::class)
-                : self::makeStore($container, $this->context, $config),
-            new ProfilerResponseDecorator($config, new Psr17Factory()),
+                : self::makeEarlyStore(container: $container, context: $this->context, config: $config),
+            decorator: static function () use ($container, $config): ProfilerResponseDecorator {
+                if ($container->has(ProfilerResponseDecorator::class) || $container->has(StreamFactoryInterface::class)) {
+                    return $container->get(ProfilerResponseDecorator::class);
+                }
+                // Before core providers, only the concrete PSR factory is registered.
+                return new ProfilerResponseDecorator(
+                    config: $config,
+                    streams: $container->get(Psr17Factory::class),
+                    ui: $container->get(ProfilerUi::class),
+                );
+            },
+            environment: $this->context->environment()->value,
+            applicationRoot: $this->context->basePath(),
         );
     }
 
@@ -65,39 +88,53 @@ final readonly class ProfilerServiceProvider implements ServiceProviderInterface
      */
     public function register(ContainerBuilderInterface $container): void
     {
-        if (!$this->context->isDevelopment() || !$container->isBound(MiddlewareStack::class)) {
+        if (!$container->isBound(MiddlewareStack::class)) {
             return;
         }
-        if (!$container->isBound(ProfilerConfig::class)) {
-            $container->singleton(ProfilerConfig::class, new ProfilerConfig());
-        }
-        if (!$container->get(ProfilerConfig::class)->enabled) {
+        if (!$container->get(ProfilerConfig::class)->enabled()) {
             return;
         }
-        $container->singleton(SqlSanitizer::class, SqlSanitizer::class);
         $container->scoped(ProfileContext::class, static function (ContainerInterface $container): ProfileContext {
             $capture = $container->get(HttpInstrumentation::class)->observer();
 
             return $capture instanceof ProfilerCapture
                 ? $capture->context()
-                : new ProfileContext($container->get(ProfilerConfig::class), $container->get(SqlSanitizer::class));
+                : new ProfileContext(
+                    config: $container->get(ProfilerConfig::class),
+                    sanitizer: $container->get(SqlSanitizer::class),
+                );
         });
-        $container->scoped(ProfilerMiddleware::class, static fn(ContainerInterface $container): ProfilerMiddleware => new ProfilerMiddleware(
-            $container->get(ApplicationContext::class),
-            $container->get(ProfilerConfig::class),
-            static fn(): ProfilerRequestHandler => $container->get(ProfilerRequestHandler::class),
+        $container->transient(ProfilerMiddleware::class, static fn(ContainerInterface $container): ProfilerMiddleware => new ProfilerMiddleware(
+            config: $container->get(ProfilerConfig::class),
+            profiler: static fn(): ProfilerRequestHandler => $container->get(ProfilerRequestHandler::class),
+            captureSession: static fn() => $container->get(ProfileContext::class)->captureSession(
+                $container->has(SessionConfig::class)
+                    ? $container->get(SessionConfig::class) : null,
+            ),
         ));
-        $container->singleton(ProfilerUi::class, ProfilerUi::class);
-        $container->singleton(ProfilerRequestHandler::class, ProfilerRequestHandler::class);
-        $context = $this->context;
-        $container->singleton(ProfileStore::class, static fn(ContainerInterface $container): ProfileStore => self::makeStore(
-            $container,
-            $context,
-            $container->get(ProfilerConfig::class),
-        ));
+        $container->decorate(SessionInterface::class, static function (ContainerInterface $container, mixed $inner): SessionInterface {
+            assert($inner instanceof SessionInterface);
+            $container->get(ProfileContext::class)->observeSession($inner);
+            return $inner;
+        });
+        $container->transient(ProfileStore::class, static function (ContainerInterface $container): ProfileStore {
+            $context = $container->get(ApplicationContext::class);
+
+            return new ProfileStore(
+                directory: $context->resolveWritablePath('profiler'),
+                publicRoot: $context->publicPath(),
+                config: $container->get(ProfilerConfig::class),
+                directories: $container->get(DirectoryManagerInterface::class),
+                files: $container->get(FileManagerInterface::class),
+                locks: $container->get(LockManagerInterface::class),
+            );
+        });
         $container->decorate(ViewRendererInterface::class, static function (ContainerInterface $container, mixed $inner): ViewRendererInterface {
             assert($inner instanceof ViewRendererInterface);
-            return new ProfiledViewRenderer($inner, $container->get(ProfileContext::class));
+            return new ProfiledViewRenderer(
+                inner: $inner,
+                context: $container->get(ProfileContext::class),
+            );
         });
     }
 
@@ -106,29 +143,33 @@ final readonly class ProfilerServiceProvider implements ServiceProviderInterface
      */
     public function boot(ContainerInterface $container): void
     {
-        if (!$this->context->isDevelopment() || !$container->has(MiddlewareStack::class)) {
+        if (!$container->has(MiddlewareStack::class)) {
             return;
         }
-        if (!$container->get(ProfilerConfig::class)->enabled) {
+        if (!$container->get(ProfilerConfig::class)->enabled()) {
             return;
         }
         $stack = $container->get(MiddlewareStack::class);
         $stack->remove(ProfilerMiddleware::class)->prepend(ProfilerMiddleware::class);
     }
 
-    private static function makeStore(ContainerInterface $container, ApplicationContext $context, ProfilerConfig $config): ProfileStore
-    {
-        $directories = $container->has(DirectoryManagerInterface::class)
-            ? $container->get(DirectoryManagerInterface::class)
-            : new DirectoryManager();
+    /**
+     * Keeps early HTTP capture writable when bootstrap fails before filesystem bindings exist.
+     */
+    private static function makeEarlyStore(
+        ContainerInterface $container,
+        ApplicationContext $context,
+        ProfilerConfig $config,
+    ): ProfileStore {
+        $directories = $container->get(DirectoryManager::class);
 
         return new ProfileStore(
-            $context->resolveWritablePath('profiler'),
-            $context->publicPath(),
-            $config,
-            $directories,
-            $container->has(FileManagerInterface::class) ? $container->get(FileManagerInterface::class) : new FileManager(),
-            $container->has(LockManagerInterface::class) ? $container->get(LockManagerInterface::class) : new LockManager($directories),
+            directory: $context->resolveWritablePath('profiler'),
+            publicRoot: $context->publicPath(),
+            config: $config,
+            directories: $directories,
+            files: $container->get(FileManager::class),
+            locks: new LockManager($directories),
         );
     }
 }
