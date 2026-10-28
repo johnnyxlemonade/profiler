@@ -1,0 +1,28 @@
+/vendor/
+/build/
+/composer.lock
+/composer-dev.lock
+/composer-dev.json
+
+# Local configuration and credentials
+/.env
+/.env.*
+!/.env.example
+/phpunit.xml
+/phpstan.neon
+/.idea/
+/.vscode/
+
+# Runtime data and generated files
+/storage/
+/var/
+/tmp/
+/cache/
+/coverage/
+/.phpunit.cache/
+*.log
+*.cache
+*.tmp
+*.bak
+*.swp
+.DS_Store
