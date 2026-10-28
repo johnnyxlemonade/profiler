@@ -1,6 +1,6 @@
 {
   "name": "johnnyxlemonade/profiler",
-  "description": "Local development request, SQL and rendering profiler for Lemonade Framework.",
+  "description": "Request, SQL and rendering profiler for Lemonade Framework with an interactive debug toolbar and request history.",
   "type": "library",
   "license": "Apache-2.0",
   "require": {
